@@ -9,6 +9,7 @@ import json
 import re
 import time
 import threading
+import qrcode
 
 from mediapipe.framework.formats import landmark_pb2
 
@@ -95,6 +96,46 @@ class HandGestureControlApp:
         # New variables for non-blocking poem generation
         self.is_generating_poem = False # Flag to indicate if poem generation is in progress
         self.poem_thread = None # To hold the thread object
+
+    def _screenshot_and_generate_qr(self, image):
+        """Captures a screenshot and generates a QR code with the current poem."""
+        if self.screenshot_cooldown > 0:
+            return
+
+        # Capture screenshot
+        cv2.imwrite(self.screenshot_path, image)
+        self.screenshot_taken = True
+        self.screenshot_cooldown = self.screenshot_cooldown_frames
+        self.screenshot_text = f"Screenshot saved as {self.screenshot_path}!"
+        self.screenshot_text_color = self.UI_ACCENT_COLOR # Change text color to indicate success
+        print(f"Screenshot taken and saved to {self.screenshot_path}")
+        # Generate QR code with the current poem
+        try:
+            import qrcode
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=4,
+            )
+            qr.add_data(self.generated_poem)
+            qr.make(fit=True)
+            qr_image = qr.make_image(fill_color="black", back_color="white")
+            qr_image.save("poem_qr_code.png")
+            print("QR code generated and saved as poem_qr_code.png")
+        except ImportError:
+            print("qrcode module not found. Install it with 'pip install qrcode[pil]' to enable QR code generation.")
+            self.screenshot_text = "QR code generation failed: qrcode module not installed."
+            self.screenshot_text_color = self.UI_ERROR_COLOR
+    
+    def _reset_screenshot_state(self):
+        """Resets the screenshot state after a cooldown period."""
+        if self.screenshot_cooldown > 0:
+            self.screenshot_cooldown -= 1
+        if self.screenshot_cooldown <= 0:
+            self.screenshot_taken = False
+            self.screenshot_text = "Take a screenshot by making the 'I Love You' gesture!"
+            self.screenshot_text_color = self.UI_TEXT_COLOR
 
     def _get_font_scale(self, base_scale, img_height):
         """Calculates dynamic font scale based on image height."""
@@ -396,7 +437,7 @@ class HandGestureControlApp:
         
         try:
             # Ollama API endpoint for generating text
-            ollama_api_url = "http://localhost:11434/api/generate" 
+            ollama_api_url = "https://festivals-gen-upper-maple.trycloudflare.com/api/generate" 
             
             # Updated payload with system prompt and temperature settings
             payload = {
@@ -826,10 +867,17 @@ class HandGestureControlApp:
         #                         self.poem_generation_cooldown, self.POEM_GENERATION_COOLDOWN_FRAMES,
         #                         color=self.UI_ACCENT_COLOR if self.poem_generation_cooldown > 0 else (50,50,50))
 
-
     def run(self):
         """Main application loop to capture frames and process gestures."""
         self.initialize_app() # Call the new initialization method
+
+        # --- Screenshot state variables ---
+        self.screenshot_taken = False
+        self.screenshot_cooldown = 0
+        self.screenshot_cooldown_frames = 60  # 2 seconds at 30 FPS
+        self.screenshot_path = "tarot_screenshot.png"
+        self.screenshot_text = "Take a screenshot by making the 'I Love You' gesture!"
+        self.screenshot_text_color = self.UI_TEXT_COLOR
 
         while self.cap.isOpened():
             success, image = self.cap.read()
@@ -853,61 +901,76 @@ class HandGestureControlApp:
             recognition_result = self.recognizer.recognize_for_video(mp_image, self.frame_timestamp_ms)
 
             # Process hand landmarks and gestures
+            detected_gesture_this_frame = None
             if recognition_result.hand_landmarks:
                 self._process_hand_landmarks(image, recognition_result)
+                # --- Detect "I Love You" gesture for screenshot ---
+                for hand_index, hand_gestures in enumerate(recognition_result.gestures):
+                    if hand_gestures:
+                        gesture_name = hand_gestures[0].category_name
+                        if gesture_name == "ILoveYou":
+                            detected_gesture_this_frame = "I Love You"
+                            break
             else:
                 self.gesture_counts["None"] += 1 # No hands detected
                 self.any_hand_detected_this_frame = False # No hands means not detected
-                
+
+            # --- Screenshot logic with "I Love You" gesture ---
+            if detected_gesture_this_frame == "I Love You" and not self.screenshot_taken and self.screenshot_cooldown <= 0:
+                self._screenshot_and_generate_qr(image)
+
+            self._reset_screenshot_state()
+
+            # ...existing color picker/poem logic...
+
             # Auto-deactivation logic for color picker AND NEW poem generation trigger
-            # This triggers when the hand stops picking a color after actively doing so,
-            # which signifies the completion of a color selection.
             if self.is_color_picker_active and self.was_hand_picking_color_in_prev_frame and not self.is_hand_picking_color:
-                # User just released pinch after picking a color. Trigger poem generation.
-                # Only generate if color changed and not already generating, and cooldown is ready
                 if (self.current_overlay_color != self.last_color_for_poem_gen) and \
                    (not self.is_generating_poem) and \
                    (self.poem_generation_cooldown <= 0):
-                    
                     self._start_poem_generation_thread(self.mood_text, self.warmth_text)
                     self.last_color_for_poem_gen = self.current_overlay_color
                     self.poem_generation_cooldown = self.POEM_GENERATION_COOLDOWN_FRAMES # Reset cooldown
-                
-                # Now, deactivate the color picker as the interaction is complete
                 self.is_color_picker_active = False
 
-            # Handle toggle gesture (Peace Sign) cooldown
             if self.current_gesture_cooldown > 0:
                 self.current_gesture_cooldown -= 1
 
-            # Handle poem generation cooldown (decrements even during generation)
             if self.poem_generation_cooldown > 0:
                 self.poem_generation_cooldown -= 1
 
-            # Toggle color picker with Peace Sign gesture
             if self.is_peace_sign_detected_this_frame and not self.gesture_active_in_prev_frame and self.current_gesture_cooldown <= 0:
                 self.is_color_picker_active = not self.is_color_picker_active
                 self.current_gesture_cooldown = self.GESTURE_TOGGLE_COOLDOWN_FRAMES
                 self.is_hand_picking_color = False
                 self.was_hand_picking_color_in_prev_frame = False
-                # If color picker is deactivated, force poem regeneration next time it's active and color changes
-                self.last_color_for_poem_gen = (-1, -1, -1) # dummy value to ensure color is "different"
-                # If toggling off, stop any pending poem generation and clear message
+                self.last_color_for_poem_gen = (-1, -1, -1)
                 if not self.is_color_picker_active and self.is_generating_poem:
-                    # In a more robust system, you'd send a signal to the thread to stop
-                    # For simplicity, here we just acknowledge it will finish and update later.
                     self.is_generating_poem = False
                     self.generated_poem = "Poem generation cancelled."
                     if self.poem_thread and self.poem_thread.is_alive():
-                        # A better way would be to make the thread stoppable, but for now, let it finish or join.
-                        # For now, we'll let it finish in the background if it's already started.
                         pass
-
 
             self.gesture_active_in_prev_frame = self.is_peace_sign_detected_this_frame
 
             # Draw all UI elements on the image
             self._draw_ui_elements(image)
+
+            # --- Draw screenshot status text (bottom center) ---
+            img_height, img_width, _ = image.shape
+            padding = self._get_padding(img_width, img_height)
+            font_scale = self._get_font_scale(self.BODY_FONT_SCALE, img_height)
+            (txt_w, txt_h), _ = cv2.getTextSize(self.screenshot_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, self.THICKNESS_BOLD)
+            cv2.putText(
+                image,
+                self.screenshot_text,
+                ((img_width - txt_w) // 2, img_height - padding),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                self.screenshot_text_color,
+                self.THICKNESS_BOLD,
+                cv2.LINE_AA
+            )
 
             # Show the final image
             cv2.imshow('Tarot', image) # Reverted window title
@@ -921,22 +984,18 @@ class HandGestureControlApp:
                 self.is_hand_picking_color = False
                 self.was_hand_picking_color_in_prev_frame = False
                 self.current_gesture_cooldown = self.GESTURE_TOGGLE_COOLDOWN_FRAMES
-                # If color picker is toggled via 'c', force poem regeneration next time
-                self.last_color_for_poem_gen = (-1, -1, -1) # dummy value to ensure color is "different"
-                # If toggling off, stop any pending poem generation and clear message
+                self.last_color_for_poem_gen = (-1, -1, -1)
                 if not self.is_color_picker_active and self.is_generating_poem:
                     self.is_generating_poem = False
                     self.generated_poem = "Poem generation cancelled."
                     if self.poem_thread and self.poem_thread.is_alive():
-                        pass # Let it finish, or implement a stop signal if needed.
+                        pass
 
-        # Ensure the camera is released and windows are destroyed even if a thread is running
         self.cap.release()
         cv2.destroyAllWindows()
-        # Optional: wait for the poem thread to finish before truly exiting
         if self.poem_thread and self.poem_thread.is_alive():
             print("Waiting for poem generation thread to finish...")
-            self.poem_thread.join(timeout=5) # Wait for max 5 seconds
+            self.poem_thread.join(timeout=5)
             if self.poem_thread.is_alive():
                 print("Poem thread did not finish gracefully.")
 
